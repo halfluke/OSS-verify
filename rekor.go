@@ -113,11 +113,14 @@ type rekorLogInfo struct {
 	RootHash       string `json:"rootHash"`
 	TreeSize       int64  `json:"treeSize"`
 	SignedTreeHead string `json:"signedTreeHead"`
-	TreeID         string `json:"treeID"`
+	// TreeID is the decimal numeric tree ID returned by the Rekor API.
+	// This is NOT the same as logId.keyId in bundles, which is a key fingerprint.
+	TreeID string `json:"treeID"`
 }
 
 // fetchCurrentRekorHead fetches the current Rekor tree head.
-// The URL is the Rekor base URL (e.g. https://rekor.sigstore.dev).
+// treeID should be the decimal numeric tree ID from a previous log response,
+// or empty to query the default (active) tree.
 func fetchCurrentRekorHead(ctx context.Context, rekorURL, treeID string) (*RekorCheckpoint, error) {
 	url := rekorURL + "/api/v1/log"
 	if treeID != "" {
@@ -151,8 +154,15 @@ func fetchCurrentRekorHead(ctx context.Context, rekorURL, treeID string) (*Rekor
 		return nil, fmt.Errorf("normalizing Rekor root hash: %w", err)
 	}
 
+	// Always use the treeID from the response — this is the canonical decimal
+	// numeric ID. If a specific treeID was requested and the response differs,
+	// the response wins (it may canonicalise the value).
+	resolvedTreeID := info.TreeID
+	if resolvedTreeID == "" {
+		resolvedTreeID = treeID
+	}
 	return &RekorCheckpoint{
-		TreeID:   treeID, // use the treeID we queried with
+		TreeID:   resolvedTreeID,
 		TreeSize: info.TreeSize,
 		RootHash: rootHash,
 	}, nil
@@ -276,18 +286,24 @@ func checkRekorConsistency(ctx context.Context, cfg *Config, result *VerifyResul
 
 	rekorURL := defaultRekorURL
 
-	// Fetch the current Rekor tree head.
-	currentCP, err := fetchCurrentRekorHead(ctx, rekorURL, bundleCP.TreeID)
+	// Fetch the current Rekor tree head. Do NOT pass the bundle's logId.keyId
+	// as the treeID — that is a key fingerprint (hex), not the numeric tree ID
+	// the API requires. Fetching without treeID returns the active tree's head
+	// along with its numeric treeID in the response, which we then use for
+	// the consistency proof call.
+	currentCP, err := fetchCurrentRekorHead(ctx, rekorURL, "")
 	if err != nil {
 		logWarn("Could not fetch Rekor tree head: %v — skipping consistency check.", err)
 		return nil
 	}
-	debugf("Rekor current head: treeSize=%d rootHash=%s...", currentCP.TreeSize, currentCP.RootHash[:16])
+	debugf("Rekor current head: treeID=%s treeSize=%d rootHash=%s...",
+		currentCP.TreeID, currentCP.TreeSize, currentCP.RootHash[:16])
 
 	// Verify that the current head is an extension of the bundle checkpoint.
 	// This proves the log has not been rolled back since the signing event.
+	// Use the decimal treeID from the current head for the API call.
 	if currentCP.TreeSize > bundleCP.TreeSize {
-		proofHashes, err := fetchRekorConsistencyProof(ctx, rekorURL, bundleCP.TreeSize, currentCP.TreeSize, bundleCP.TreeID)
+		proofHashes, err := fetchRekorConsistencyProof(ctx, rekorURL, bundleCP.TreeSize, currentCP.TreeSize, currentCP.TreeID)
 		if err != nil {
 			logWarn("Could not fetch consistency proof (bundle→current): %v — skipping.", err)
 		} else {
