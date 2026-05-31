@@ -21,7 +21,7 @@ proofs, and a lockfile that pins hashes across your team.
 |---|---|---|
 | cosign verification | subprocess `exec cosign` | **library call** via `sigstore-go` |
 | Rekor inclusion proof | via cosign subprocess | verified inside process |
-| **Rekor consistency proofs** | ✗ not possible in bash | **✓ full Merkle consistency** |
+| **Rekor consistency proofs** | feasible but impractical in bash | **✓ full Merkle consistency** |
 | **Identity–repo cross-check** | ✗ missing (security gap) | **✓ identity must belong to `--repo`** |
 | Lockfile missing-hash handling | warn + skip | **abort** |
 | Binary install | direct `mv` | **atomic rename via temp file** |
@@ -53,6 +53,56 @@ The current Rekor tree head is also stored in the lockfile. On subsequent
 installs, a second consistency check runs between the saved checkpoint and the
 new one — detecting any log manipulation that happened between your first and
 second install of the same version.
+
+### On Rekor witnesses
+
+The Sigstore ecosystem has a witness network — third-party servers that
+independently observe Rekor checkpoints and co-sign them. If witnesses refused
+to cosign an inconsistent checkpoint, even a fully compromised Rekor instance
+could be detected.
+
+**Why this is not implemented yet (in bash or Go):**
+
+The public Rekor instance (`rekor.sigstore.dev`) currently includes only its
+own self-signature in the signed tree head — there are no external witness
+cosignatures in the API response to verify. This was confirmed by inspection:
+
+```
+— rekor.sigstore.dev <sig>     ← Rekor's own ECDSA P-256 self-signature only
+                               ← no external witness lines
+```
+
+The witness infrastructure for Rekor exists in the Sigstore ecosystem but is
+not yet operationally active in a way that exposes cosignatures to clients.
+This is an infrastructure maturity issue, not a tooling one.
+
+**On the "cannot be done in bash" claim:**
+
+That claim was tested and found to be wrong. OpenSSL 3.x supports both
+Ed25519 and ECDSA P-256 verification in shell scripts. Rekor's own checkpoint
+signature (ECDSA P-256 over the note body) can be verified with:
+
+```bash
+openssl dgst -sha256 -verify rekor_pub.pem -signature sig.bin checkpoint_body.txt
+```
+
+And Ed25519 (used by external witnesses) works identically:
+
+```bash
+openssl pkeyutl -verify -pubin -inkey witness_pub.pem \
+  -in checkpoint_body.bin -sigfile witness_sig.bin
+```
+
+The real complexity in bash would be parsing the note key format (which
+encodes public keys differently from standard PEM) and discovering which
+witness endpoints to query — both fiddly but not cryptographically impossible.
+Go's `golang.org/x/mod/sumdb/note` package handles the format natively, making
+the implementation cleaner. But neither bash nor Go can currently implement
+external witness verification against the public Rekor instance because the
+cosignatures are not there yet.
+
+When the witness infrastructure matures, adding witness verification is a
+meaningful future improvement — in either language.
 
 ### Security fix: identity–repo cross-check
 
