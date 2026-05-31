@@ -384,6 +384,76 @@ func searchRekorForEntry(ctx context.Context, hexDigest string, certDER, sigByte
 	return len(uuids) > 0, nil
 }
 
+// ── Rekor Merkle inclusion proof ─────────────────────────────────────────────
+
+// verifyInclusionProof verifies that the bundle's canonicalized entry body
+// is committed to the Merkle tree described by the bundle's inclusion proof.
+//
+// The RFC 6962 leaf hash is computed as:
+//
+//	rfc6962.DefaultHasher.HashLeaf(base64decode(entry.CanonicalizedBody))
+//	= SHA256(0x00 || canonBodyBytes)
+//
+// This is then verified against the sibling hashes and root hash from the
+// inclusion proof, confirming the entry was appended to the Rekor log at
+// the stated position (logIndex).
+func verifyInclusionProof(entry bundleTlogEntry) error {
+	ip := entry.InclusionProof
+	if ip.LogIndex == "" || ip.TreeSize == "" || ip.RootHash == "" || entry.CanonicalizedBody == "" {
+		return fmt.Errorf("bundle inclusion proof is incomplete " +
+			"(missing logIndex, treeSize, rootHash, or canonicalizedBody)")
+	}
+
+	// Compute the RFC 6962 leaf hash from the canonicalized entry body.
+	canonBytes, err := base64.StdEncoding.DecodeString(entry.CanonicalizedBody)
+	if err != nil {
+		return fmt.Errorf("decoding canonicalizedBody: %w", err)
+	}
+	leafHash := rfc6962.DefaultHasher.HashLeaf(canonBytes)
+
+	logIdx, err := strconv.ParseUint(ip.LogIndex, 10, 64)
+	if err != nil {
+		return fmt.Errorf("parsing inclusionProof.logIndex %q: %w", ip.LogIndex, err)
+	}
+	treeSz, err := strconv.ParseUint(ip.TreeSize, 10, 64)
+	if err != nil {
+		return fmt.Errorf("parsing inclusionProof.treeSize %q: %w", ip.TreeSize, err)
+	}
+
+	rootHashHex, err := normalizeHash(ip.RootHash)
+	if err != nil {
+		return fmt.Errorf("normalizing inclusion proof rootHash: %w", err)
+	}
+	rootHashBytes, err := hex.DecodeString(rootHashHex)
+	if err != nil {
+		return fmt.Errorf("decoding rootHash hex: %w", err)
+	}
+
+	siblingHashes := make([][]byte, 0, len(ip.Hashes))
+	for i, h := range ip.Hashes {
+		hHex, err := normalizeHash(h)
+		if err != nil {
+			return fmt.Errorf("normalizing inclusion proof hash[%d]: %w", i, err)
+		}
+		hBytes, err := hex.DecodeString(hHex)
+		if err != nil {
+			return fmt.Errorf("decoding inclusion proof hash[%d]: %w", i, err)
+		}
+		siblingHashes = append(siblingHashes, hBytes)
+	}
+
+	if err := proof.VerifyInclusion(rfc6962.DefaultHasher, logIdx, treeSz, leafHash, siblingHashes, rootHashBytes); err != nil {
+		return fmt.Errorf(
+			"Rekor inclusion proof FAILED.\n"+
+				"        LogIndex: %d, TreeSize: %d, RootHash: %s...\n"+
+				"        The Rekor entry may be invalid or the bundle tampered with.\n"+
+				"        Error: %w",
+			logIdx, treeSz, rootHashHex[:16], err,
+		)
+	}
+	return nil
+}
+
 // ── Hash normalization ────────────────────────────────────────────────────────
 
 // normalizeHash converts a hash to lowercase hex, accepting either hex or base64 input.

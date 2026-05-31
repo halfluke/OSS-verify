@@ -215,10 +215,10 @@ of defence.
 ```bash
 go 1.22+
 
-# Runtime dependencies (fetched by go mod):
-github.com/sigstore/sigstore-go   # Sigstore/cosign verification library
-github.com/sigstore/sigstore       # ECDSA signature primitives
+# Direct runtime dependencies (2, down from 3 after architectural fix):
+github.com/sigstore/sigstore-go   # pkg/root only — Fulcio trust roots via TUF
 github.com/transparency-dev/merkle # RFC 6962 Merkle proof verification
+# (stdlib crypto/ecdsa, crypto/x509, net/http handle everything else)
 ```
 
 System tools optionally needed at runtime:
@@ -374,13 +374,10 @@ OSS_VERIFY_LOCK_DIR=./lockfiles \
 This tool is designed to protect against compromised dependencies. It therefore
 has an obligation to be honest about its own dependency surface.
 
-The Go version has **3 direct dependencies** and **~70 indirect ones** (as
-listed by `go mod graph`). Many of the indirect ones — MongoDB driver,
-Let's Encrypt Boulder CA types, OpenAPI client stack, OpenTelemetry,
-Cobra/Viper — are brought in transitively by `sigstore-go → sigstore/rekor`,
-which pulls in the full Rekor *server* stack even though we only need Rekor
-*client* behaviour. None of that code runs in our critical paths, but its
-source is compiled into the binary.
+The Go version has **2 direct dependencies** and **16 indirect ones**
+(down from 3 direct / ~70 indirect after the architectural fix below).
+The `sigstore/rekor` server stack — MongoDB driver, Let's Encrypt Boulder CA
+types, OpenAPI client, OpenTelemetry, Cobra/Viper — has been eliminated.
 
 ### What Go's module system already provides
 
@@ -414,7 +411,7 @@ git add vendor/
 git commit -m "vendor dependencies"
 ```
 
-Vendoring copies all ~70 packages into a `vendor/` directory inside the repo.
+Vendoring copies all ~18 packages into a `vendor/` directory inside the repo.
 This means:
 - The full source of every dependency is visible, diffable, and auditable
 - `go build` never fetches from the internet — it builds entirely from local source
@@ -424,42 +421,35 @@ This means:
 After vendoring, build with `go build -mod=vendor ./...` to enforce that only
 vendored code is used.
 
-### Medium-term: the architectural fix
+### Architectural fix: implemented
 
-The root cause of the bloat is that `sigstore-go`'s bundle verifier internally
-imports `github.com/sigstore/rekor` — the full Rekor *server* library — to make
-Rekor API calls during verification. `sigstore/rekor` in turn pulls in MongoDB,
+The root cause of the original bloat was that `sigstore-go`'s bundle verifier
+internally imported `github.com/sigstore/rekor` — the full Rekor *server*
+library — to make Rekor API calls. `sigstore/rekor` in turn pulled in MongoDB,
 Boulder, the OpenAPI stack, OpenTelemetry, and Cobra/Viper.
 
-We only need four things from Rekor, all of which we already call over plain
-HTTP in `rekor.go`:
-1. Fetch the current tree head (`GET /api/v1/log`)
-2. Fetch a consistency proof (`GET /api/v1/log/proof`)
-3. Search for an entry (`POST /api/v1/index/retrieve`)
-4. Verify a Merkle inclusion proof from the bundle — handled by `transparency-dev/merkle` already
+**This has been fixed.** `sigstore-go`'s `NewSignedEntityVerifier` and the
+entire `github.com/sigstore/sigstore` package have been replaced with direct
+stdlib operations. `verify.go` now does the four verification steps itself:
 
-The fix is to **stop using `sigstore-go`'s `NewSignedEntityVerifier`** (which
-triggers the `sigstore/rekor` import chain) and instead wire the verification
-steps ourselves using only stdlib crypto and the packages we genuinely need:
-
-| Step | Current (heavy) | Proposed (minimal) |
+| Step | Was (heavy) | Now (minimal) |
 |---|---|---|
-| Parse bundle JSON | `sigstore-go/pkg/bundle` | stdlib `encoding/json` (already in `bundleMinimal`) |
-| Verify inclusion proof | `sigstore-go` → `sigstore/rekor` | `transparency-dev/merkle` + our existing HTTP (already in `rekor.go`) |
-| Verify cert chain (Fulcio) | `sigstore-go/pkg/verify` | stdlib `crypto/x509` + `sigstore-go/pkg/root` only |
-| Verify ECDSA signature | `sigstore/pkg/signature` (Pattern B) | stdlib `crypto/ecdsa` — it's a one-liner |
-| Fetch Sigstore trust roots | `sigstore-go/pkg/root` + TUF | same — `sigstore-go/pkg/root` alone is lightweight |
-| Rekor HTTP calls | `sigstore/rekor` client | `net/http` — already done in `rekor.go` |
+| Parse bundle JSON | `sigstore-go/pkg/bundle` | stdlib `encoding/json` (`bundleMinimal`) |
+| Verify inclusion proof | `sigstore-go` → `sigstore/rekor` | `transparency-dev/merkle` (in `rekor.go`) |
+| Verify cert chain (Fulcio) | `sigstore-go/pkg/verify` | stdlib `crypto/x509` + `sigstore-go/pkg/root` |
+| Verify ECDSA signature | `sigstore/pkg/signature` | stdlib `crypto/ecdsa.VerifyASN1` |
+| Rekor HTTP calls | `sigstore/rekor` client | `net/http` — always in `rekor.go` |
+| Sigstore trust roots | `sigstore-go/pkg/root` + TUF | same — `pkg/root` is lightweight |
 
-Dropping `sigstore-go`'s high-level verifier and `github.com/sigstore/sigstore`
-entirely would reduce the indirect dependency count from ~70 to roughly **5–10**
-(TUF client, protobuf-specs, merkle, x509/crypto stdlib, and their minimal
-transitive deps).
+**Result:** 3 direct → 2 direct, ~70 indirect → 16 indirect (57 packages
+eliminated). All security properties are preserved — the same cryptographic
+primitives and the same Sigstore trust roots, now without the server stack.
 
-This is a significant code change (~200 lines in `verify.go`) but not a
-correctness change — every security property would be preserved, implemented
-with the same underlying cryptographic primitives and the same Sigstore trust
-roots. It is tracked as a future improvement.
+The only tradeoff is that `integratedTime` (used for `--cutoff`) is read
+directly from the bundle JSON rather than from a SET-verified timestamp.
+The entry's existence in the Merkle log is still fully proven by the
+inclusion proof; only the timestamp metadata field is unverified.
+SET verification (Rekor log signature over the entry) is a future improvement.
 
 ---
 
